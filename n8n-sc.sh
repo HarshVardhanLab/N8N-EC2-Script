@@ -2,12 +2,18 @@
 # =============================================================================
 # setup-n8n.sh — Production-ready n8n installer for AWS EC2 Ubuntu 22.04/24.04
 # Author  : DevOps Engineer
-# Version : 2.0.0
+# Version : 3.0.0
 # License : MIT
 # =============================================================================
 # Usage:
 #   chmod +x setup-n8n.sh
 #   ./setup-n8n.sh
+#
+# HTTPS Options (all FREE, no domain purchase required):
+#   1) Cloudflare Tunnel  — instant HTTPS via *.trycloudflare.com (no domain)
+#   2) DuckDNS + Certbot  — free permanent subdomain + Let's Encrypt SSL
+#   3) Own Domain + Nginx — bring your own domain, Certbot issues SSL
+#   4) IP only (no HTTPS) — plain HTTP on port 5678
 # =============================================================================
 
 set -euo pipefail
@@ -17,7 +23,7 @@ IFS=$'\n\t'
 # TRAP — run cleanup() on any unexpected exit
 # -----------------------------------------------------------------------------
 trap 'on_error $LINENO' ERR
-trap 'cleanup' EXIT
+trap 'cleanup'          EXIT
 
 # =============================================================================
 # ANSI COLOUR CODES
@@ -27,6 +33,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
@@ -40,6 +47,13 @@ DOMAIN_NAME=""
 USE_HTTPS=false
 LOG_FILE="/tmp/setup-n8n-$(date +%Y%m%d-%H%M%S).log"
 
+# HTTPS mode: "none" | "cloudflare_tunnel" | "duckdns" | "own_domain"
+HTTPS_MODE="none"
+DUCKDNS_TOKEN=""
+DUCKDNS_SUBDOMAIN=""
+TUNNEL_URL=""        # populated after cloudflared starts
+FINAL_URL=""         # the URL shown to the user at the end
+
 # =============================================================================
 # LOGGING HELPERS
 # =============================================================================
@@ -49,13 +63,14 @@ success() { echo -e "${GREEN}[OK]${RESET}    $*" | tee -a "$LOG_FILE"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*" | tee -a "$LOG_FILE"; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" | tee -a "$LOG_FILE" >&2; }
 step()    { echo -e "\n${BLUE}${BOLD}━━━  $* ${RESET}\n" | tee -a "$LOG_FILE"; }
+heading() { echo -e "\n${MAGENTA}${BOLD}  ▶  $*${RESET}\n"; }
 
 banner() {
   echo -e "${CYAN}${BOLD}"
-  echo "╔══════════════════════════════════════════════════════════╗"
-  echo "║          n8n  ·  Docker Installer  ·  AWS EC2            ║"
-  echo "║          Ubuntu 22.04 / 24.04  —  Production Ready       ║"
-  echo "╚══════════════════════════════════════════════════════════╝"
+  echo "╔══════════════════════════════════════════════════════════════╗"
+  echo "║         n8n  ·  Docker Installer  ·  AWS EC2  v3.0          ║"
+  echo "║   Ubuntu 22.04 / 24.04  —  Production Ready  —  Free HTTPS  ║"
+  echo "╚══════════════════════════════════════════════════════════════╝"
   echo -e "${RESET}"
 }
 
@@ -74,123 +89,12 @@ on_error() {
 # CLEANUP — called on EXIT (success or failure)
 # =============================================================================
 cleanup() {
-  # Nothing destructive here — just informational.
-  # Extend this function to remove temp files if needed.
-  :
-}
-
-# =============================================================================
-# FUNCTION: check_container_exists
-# Detects whether an n8n container (running OR stopped) already exists.
-# Sets global flags:
-#   CONTAINER_EXISTS=true/false
-#   CONTAINER_RUNNING=true/false
-#   OLD_WEBHOOK_URL  — the WEBHOOK_URL currently baked into the container env
-# =============================================================================
-check_container_exists() {
-  step "Checking for existing n8n container"
-
-  CONTAINER_EXISTS=false
-  CONTAINER_RUNNING=false
-  OLD_WEBHOOK_URL=""
-
-  # Does ANY container (running or stopped) exist with this name?
-  if docker ps -a --filter "name=^${CONTAINER_NAME}$" \
-       --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
-
-    CONTAINER_EXISTS=true
-
-    # Is it currently running?
-    if docker ps --filter "name=^${CONTAINER_NAME}$" --filter "status=running" \
-         --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
-      CONTAINER_RUNNING=true
-    fi
-
-    # Extract current WEBHOOK_URL from container inspect (best-effort)
-    OLD_WEBHOOK_URL=$(docker inspect "${CONTAINER_NAME}" 2>/dev/null \
-      | grep -oP '(?<="WEBHOOK_URL=)[^"]+' | head -1 || true)
-
-    if $CONTAINER_RUNNING; then
-      info "Container '${CONTAINER_NAME}' EXISTS and is RUNNING."
-    else
-      info "Container '${CONTAINER_NAME}' EXISTS but is STOPPED."
-    fi
-    [[ -n "$OLD_WEBHOOK_URL" ]] && info "Current WEBHOOK_URL: ${OLD_WEBHOOK_URL}"
-
-  else
-    info "No existing container named '${CONTAINER_NAME}' found."
-  fi
-}
-
-# =============================================================================
-# FUNCTION: update_webhook_url
-# Patches the WEBHOOK_URL inside docker-compose.yml to the current public IP,
-# then recreates the container so the new env var takes effect immediately.
-# Data volume is preserved — no data is lost.
-# =============================================================================
-update_webhook_url() {
-  step "Updating WEBHOOK_URL with current public IP"
-
-  local compose_file="${N8N_DIR}/docker-compose.yml"
-
-  # Build the new webhook URL
-  local new_webhook
-  if [[ -n "$DOMAIN_NAME" ]]; then
-    local proto="http"
-    $USE_HTTPS && proto="https"
-    new_webhook="${proto}://${DOMAIN_NAME}/"
-  else
-    new_webhook="http://${PUBLIC_IP}:${N8N_PORT}/"
-  fi
-
-  WEBHOOK_URL="$new_webhook"
-
-  if [[ ! -f "$compose_file" ]]; then
-    warn "docker-compose.yml not found at ${compose_file}."
-    warn "Regenerating it now with the new IP…"
-    create_compose_file
-    return 0
-  fi
-
-  # Replace the WEBHOOK_URL line in the existing compose file
-  # Handles both  "- WEBHOOK_URL=..."  and  "WEBHOOK_URL=..."  forms
-  if grep -q "WEBHOOK_URL=" "$compose_file"; then
-    sed -i "s|WEBHOOK_URL=.*|WEBHOOK_URL=${new_webhook}|g" "$compose_file"
-    success "WEBHOOK_URL updated → ${new_webhook}"
-  else
-    warn "WEBHOOK_URL line not found in compose file — regenerating file."
-    create_compose_file
-  fi
-}
-
-# =============================================================================
-# FUNCTION: restart_existing_container
-# Stops and removes the old container (keeping the volume), then brings it
-# back up with the refreshed docker-compose.yml (new IP / env vars).
-# =============================================================================
-restart_existing_container() {
-  step "Restarting existing n8n container with updated configuration"
-  cd "${N8N_DIR}"
-
-  info "Stopping container '${CONTAINER_NAME}'…"
-  docker compose down --remove-orphans >> "$LOG_FILE" 2>&1
-  success "Container stopped"
-
-  info "Pulling latest n8nio/n8n image (checking for updates)…"
-  docker compose pull >> "$LOG_FILE" 2>&1
-  success "Image check done"
-
-  info "Starting container with new WEBHOOK_URL: ${WEBHOOK_URL}…"
-  docker compose up -d >> "$LOG_FILE" 2>&1
-  success "Container restarted successfully"
-
-  info "Waiting 5 s for n8n to initialise…"
-  sleep 5
+  # Remove any temp files created during the run
+  rm -f /tmp/cloudflared_output.log 2>/dev/null || true
 }
 
 # =============================================================================
 # FUNCTION: check_root
-# Ensures the script is run with root / sudo privileges.
 # =============================================================================
 check_root() {
   step "Checking privileges"
@@ -204,7 +108,6 @@ check_root() {
 
 # =============================================================================
 # FUNCTION: check_internet
-# Verifies outbound internet connectivity before doing anything expensive.
 # =============================================================================
 check_internet() {
   step "Checking internet connectivity"
@@ -217,7 +120,6 @@ check_internet() {
 
 # =============================================================================
 # FUNCTION: detect_os
-# Confirms we are on a supported Ubuntu release.
 # =============================================================================
 detect_os() {
   step "Detecting operating system"
@@ -230,7 +132,6 @@ detect_os() {
   OS_NAME="${NAME:-unknown}"
   OS_VERSION="${VERSION_ID:-unknown}"
   info "Detected: ${OS_NAME} ${OS_VERSION}"
-
   if [[ "${ID:-}" != "ubuntu" ]]; then
     warn "This script is optimised for Ubuntu. Proceeding anyway — YMMV."
   fi
@@ -239,13 +140,13 @@ detect_os() {
 
 # =============================================================================
 # FUNCTION: detect_public_ip
-# Tries several metadata / STUN endpoints to find the server's public IP.
+# Uses EC2 IMDSv2 first, then several public fallbacks.
 # =============================================================================
 detect_public_ip() {
   step "Detecting public IP address"
   local ip=""
 
-  # AWS EC2 IMDSv2 (preferred on EC2)
+  # AWS EC2 IMDSv2
   local token
   token=$(curl -fsSL --max-time 3 \
     -X PUT "http://169.254.169.254/latest/api/token" \
@@ -257,30 +158,30 @@ detect_public_ip() {
       "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
   fi
 
-  # Fallback: public IP lookup services
+  # Fallback: public lookup services
   if [[ -z "$ip" ]]; then
-    ip=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null \
-      || curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
-      || curl -fsSL --max-time 5 https://icanhazip.com 2>/dev/null \
+    ip=$(curl -fsSL --max-time 5 https://ifconfig.me    2>/dev/null \
+      || curl -fsSL --max-time 5 https://api.ipify.org  2>/dev/null \
+      || curl -fsSL --max-time 5 https://icanhazip.com  2>/dev/null \
       || true)
   fi
 
-  # Ultimate fallback: local hostname
+  # Ultimate fallback
   if [[ -z "$ip" ]]; then
     ip=$(hostname -I | awk '{print $1}')
     warn "Could not detect public IP — using local IP: ${ip}"
   fi
 
-  PUBLIC_IP="${ip// /}"   # strip any whitespace
+  PUBLIC_IP="${ip// /}"
   success "Public IP: ${PUBLIC_IP}"
 }
 
 # =============================================================================
 # FUNCTION: optional_prompts
-# Interactively asks the user for optional customisations.
+# Asks the user how they want HTTPS configured, plus basic options.
 # =============================================================================
 optional_prompts() {
-  step "Optional configuration"
+  step "Configuration"
   echo -e "${YELLOW}Press ENTER to accept defaults shown in [brackets].${RESET}\n"
 
   # --- Port ---
@@ -297,23 +198,87 @@ optional_prompts() {
   read -rp "  Container name [${CONTAINER_NAME}]: " input_name
   [[ -n "$input_name" ]] && CONTAINER_NAME="$input_name"
 
-  # --- Domain name ---
-  read -rp "  Domain name (leave blank to use IP) []: " input_domain
-  if [[ -n "$input_domain" ]]; then
-    DOMAIN_NAME="$input_domain"
-    info "Domain set to: ${DOMAIN_NAME}"
-
-    # --- HTTPS ---
-    read -rp "  Prepare HTTPS/TLS config? (yes/no) [no]: " input_https
-    if [[ "${input_https,,}" =~ ^(yes|y)$ ]]; then
-      USE_HTTPS=true
-      info "HTTPS preparation enabled. (Certbot steps will be printed at the end.)"
-    fi
-  fi
-
   # --- Working directory ---
   read -rp "  n8n project directory [${N8N_DIR}]: " input_dir
   [[ -n "$input_dir" ]] && N8N_DIR="$input_dir"
+
+  echo ""
+  # ── HTTPS / SSL Menu ──────────────────────────────────────────────────────
+  echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────────────┐${RESET}"
+  echo -e "${BOLD}${CYAN}  │        FREE HTTPS / SSL Setup Options           │${RESET}"
+  echo -e "${BOLD}${CYAN}  ├─────────────────────────────────────────────────┤${RESET}"
+  echo -e "${BOLD}${CYAN}  │  1)${RESET} Cloudflare Tunnel  ${GREEN}(EASIEST — no domain!)${RESET}   ${CYAN}│${RESET}"
+  echo -e "${BOLD}${CYAN}  │     Instant HTTPS via *.trycloudflare.com       │${RESET}"
+  echo -e "${BOLD}${CYAN}  │                                                 │${RESET}"
+  echo -e "${BOLD}${CYAN}  │  2)${RESET} DuckDNS + Let's Encrypt  ${GREEN}(free forever)${RESET}   ${CYAN}│${RESET}"
+  echo -e "${BOLD}${CYAN}  │     yourname.duckdns.org  + Nginx + Certbot     │${RESET}"
+  echo -e "${BOLD}${CYAN}  │                                                 │${RESET}"
+  echo -e "${BOLD}${CYAN}  │  3)${RESET} Own Domain + Nginx + Certbot               ${CYAN}│${RESET}"
+  echo -e "${BOLD}${CYAN}  │     You already have a domain name              │${RESET}"
+  echo -e "${BOLD}${CYAN}  │                                                 │${RESET}"
+  echo -e "${BOLD}${CYAN}  │  4)${RESET} No HTTPS  (plain HTTP on port ${N8N_PORT})       ${CYAN}│${RESET}"
+  echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────────────┘${RESET}"
+  echo ""
+
+  local choice
+  read -rp "  Choose HTTPS option [1/2/3/4] (default: 4): " choice
+  choice="${choice:-4}"
+
+  case "$choice" in
+    1)
+      HTTPS_MODE="cloudflare_tunnel"
+      USE_HTTPS=true
+      info "Selected: Cloudflare Tunnel (free, no domain needed)"
+      ;;
+    2)
+      HTTPS_MODE="duckdns"
+      USE_HTTPS=true
+      echo ""
+      heading "DuckDNS Setup"
+      echo -e "  ${YELLOW}Step 1:${RESET} Go to ${BOLD}https://duckdns.org${RESET} and log in (Google/GitHub)"
+      echo -e "  ${YELLOW}Step 2:${RESET} Create a subdomain, e.g. ${BOLD}my-n8n${RESET}"
+      echo -e "  ${YELLOW}Step 3:${RESET} Copy your token from the top of the DuckDNS page"
+      echo ""
+      read -rp "  Your DuckDNS subdomain (e.g. my-n8n → my-n8n.duckdns.org): " DUCKDNS_SUBDOMAIN
+      if [[ -z "$DUCKDNS_SUBDOMAIN" ]]; then
+        warn "No subdomain entered. Falling back to plain HTTP."
+        HTTPS_MODE="none"; USE_HTTPS=false
+      else
+        read -rp "  Your DuckDNS token: " DUCKDNS_TOKEN
+        if [[ -z "$DUCKDNS_TOKEN" ]]; then
+          warn "No token entered. Falling back to plain HTTP."
+          HTTPS_MODE="none"; USE_HTTPS=false
+        else
+          DOMAIN_NAME="${DUCKDNS_SUBDOMAIN}.duckdns.org"
+          info "Will configure: https://${DOMAIN_NAME}"
+        fi
+      fi
+      ;;
+    3)
+      HTTPS_MODE="own_domain"
+      USE_HTTPS=true
+      echo ""
+      read -rp "  Your domain name (e.g. n8n.mysite.com): " input_domain
+      if [[ -z "$input_domain" ]]; then
+        warn "No domain entered. Falling back to plain HTTP."
+        HTTPS_MODE="none"; USE_HTTPS=false
+      else
+        DOMAIN_NAME="$input_domain"
+        echo ""
+        echo -e "  ${YELLOW}Important:${RESET} Make sure your domain's DNS A record points to:"
+        echo -e "  ${BOLD}${PUBLIC_IP}${RESET}"
+        echo -e "  (Do this in your domain registrar or Cloudflare DNS panel)"
+        echo ""
+        read -rp "  Press ENTER when DNS is configured (or Ctrl+C to abort)..." _confirm
+        info "Will configure: https://${DOMAIN_NAME}"
+      fi
+      ;;
+    4|*)
+      HTTPS_MODE="none"
+      USE_HTTPS=false
+      info "Selected: Plain HTTP on port ${N8N_PORT}"
+      ;;
+  esac
 
   echo ""
   success "Configuration accepted"
@@ -321,54 +286,40 @@ optional_prompts() {
 
 # =============================================================================
 # FUNCTION: system_update
-# Updates APT package lists and upgrades installed packages.
 # =============================================================================
 system_update() {
   step "Updating & upgrading system packages"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y                        >> "$LOG_FILE" 2>&1
-  apt-get upgrade -y                       >> "$LOG_FILE" 2>&1
+  apt-get update  -y >> "$LOG_FILE" 2>&1
+  apt-get upgrade -y >> "$LOG_FILE" 2>&1
   apt-get install -y \
-    curl \
-    wget \
-    gnupg \
-    lsb-release \
-    ca-certificates \
-    apt-transport-https \
-    software-properties-common \
-    ufw                                    >> "$LOG_FILE" 2>&1
+    curl wget gnupg lsb-release ca-certificates \
+    apt-transport-https software-properties-common \
+    ufw jq >> "$LOG_FILE" 2>&1
   success "System packages updated"
 }
 
 # =============================================================================
 # FUNCTION: install_docker
-# Installs Docker Engine via the official Docker apt repository.
-# Skips installation if Docker is already present.
 # =============================================================================
 install_docker() {
   step "Installing Docker Engine"
 
   if command -v docker &>/dev/null; then
-    local ver
-    ver=$(docker --version)
-    info "Docker is already installed: ${ver}"
+    local ver; ver=$(docker --version)
+    info "Docker already installed: ${ver}"
     success "Skipping Docker installation"
     return 0
   fi
 
   info "Adding Docker's official GPG key & repository…"
+  apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
 
-  # Remove any legacy docker packages
-  apt-get remove -y \
-    docker docker-engine docker.io containerd runc 2>/dev/null || true
-
-  # Add Docker GPG key
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
     | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
 
-  # Add Docker apt repository
   echo \
     "deb [arch=$(dpkg --print-architecture) \
     signed-by=/etc/apt/keyrings/docker.gpg] \
@@ -378,48 +329,36 @@ install_docker() {
 
   apt-get update -y >> "$LOG_FILE" 2>&1
   apt-get install -y \
-    docker-ce \
-    docker-ce-cli \
-    containerd.io \
-    docker-buildx-plugin \
-    docker-compose-plugin    >> "$LOG_FILE" 2>&1
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin >> "$LOG_FILE" 2>&1
 
   success "Docker Engine installed"
 }
 
 # =============================================================================
 # FUNCTION: install_compose
-# Verifies Docker Compose v2 plugin is available (installed above with Docker).
-# Falls back to standalone binary if plugin is missing.
 # =============================================================================
 install_compose() {
   step "Verifying Docker Compose v2"
 
   if docker compose version &>/dev/null; then
-    local ver
-    ver=$(docker compose version --short 2>/dev/null || docker compose version)
+    local ver; ver=$(docker compose version --short 2>/dev/null || docker compose version)
     success "Docker Compose v2 available: ${ver}"
     return 0
   fi
 
   warn "Docker Compose plugin not found — installing standalone binary…"
 
-  local compose_version
+  local compose_version arch
   compose_version=$(curl -fsSL \
     "https://api.github.com/repos/docker/compose/releases/latest" \
     | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
-
-  local arch
   arch=$(uname -m)
-  [[ "$arch" == "x86_64" ]] && arch="x86_64"
-  [[ "$arch" == "aarch64" ]] && arch="aarch64"
 
   curl -fsSL \
     "https://github.com/docker/compose/releases/download/v${compose_version}/docker-compose-linux-${arch}" \
     -o /usr/local/bin/docker-compose
   chmod +x /usr/local/bin/docker-compose
-
-  # Create shim so 'docker compose' works
   mkdir -p /usr/local/lib/docker/cli-plugins
   ln -sf /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
 
@@ -428,17 +367,13 @@ install_compose() {
 
 # =============================================================================
 # FUNCTION: configure_docker_service
-# Enables & starts the Docker daemon; adds current (sudo-invoking) user to the
-# docker group so they can run docker without sudo post-install.
 # =============================================================================
 configure_docker_service() {
   step "Configuring Docker service"
-
-  systemctl enable docker  >> "$LOG_FILE" 2>&1
-  systemctl start  docker  >> "$LOG_FILE" 2>&1
+  systemctl enable docker >> "$LOG_FILE" 2>&1
+  systemctl start  docker >> "$LOG_FILE" 2>&1
   success "Docker service enabled & started"
 
-  # SUDO_USER is set when the script is run with sudo
   local target_user="${SUDO_USER:-$USER}"
   if [[ -n "$target_user" && "$target_user" != "root" ]]; then
     usermod -aG docker "$target_user"
@@ -449,14 +384,12 @@ configure_docker_service() {
 
 # =============================================================================
 # FUNCTION: configure_firewall
-# Opens the n8n port in UFW if UFW is installed and active.
 # =============================================================================
 configure_firewall() {
   step "Configuring firewall (UFW)"
 
   if ! command -v ufw &>/dev/null; then
-    warn "UFW not found — skipping firewall configuration."
-    warn "Ensure port ${N8N_PORT} is open in your AWS Security Group."
+    warn "UFW not found — skipping. Ensure required ports are open in your AWS Security Group."
     return 0
   fi
 
@@ -464,60 +397,142 @@ configure_firewall() {
   ufw_status=$(ufw status | head -1)
 
   if [[ "$ufw_status" == *"inactive"* ]]; then
-    warn "UFW is installed but inactive — skipping rule (it would activate UFW)."
-    warn "Ensure port ${N8N_PORT} is open in your AWS Security Group."
+    warn "UFW inactive — skipping (it would activate UFW unexpectedly)."
+    warn "Ensure the required ports are open in your AWS Security Group."
     return 0
   fi
 
-  ufw allow "${N8N_PORT}/tcp" comment "n8n workflow automation" >> "$LOG_FILE" 2>&1
+  # Always open n8n port
+  ufw allow "${N8N_PORT}/tcp" comment "n8n" >> "$LOG_FILE" 2>&1
   success "UFW: port ${N8N_PORT}/tcp allowed"
 
-  if $USE_HTTPS; then
-    ufw allow 80/tcp  comment "HTTP (ACME challenge)" >> "$LOG_FILE" 2>&1
-    ufw allow 443/tcp comment "HTTPS"                 >> "$LOG_FILE" 2>&1
-    success "UFW: ports 80/tcp and 443/tcp allowed (HTTPS)"
+  # Open HTTP/HTTPS if needed for Nginx / Certbot
+  if [[ "$HTTPS_MODE" == "duckdns" || "$HTTPS_MODE" == "own_domain" ]]; then
+    ufw allow 80/tcp  comment "HTTP Certbot" >> "$LOG_FILE" 2>&1
+    ufw allow 443/tcp comment "HTTPS"        >> "$LOG_FILE" 2>&1
+    success "UFW: ports 80 and 443 allowed"
   fi
 }
 
 # =============================================================================
+# FUNCTION: check_container_exists
+# Detects whether the n8n container (running OR stopped) already exists.
+# =============================================================================
+check_container_exists() {
+  step "Checking for existing n8n container"
+
+  CONTAINER_EXISTS=false
+  CONTAINER_RUNNING=false
+  OLD_WEBHOOK_URL=""
+
+  if docker ps -a --filter "name=^${CONTAINER_NAME}$" \
+       --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+
+    CONTAINER_EXISTS=true
+
+    if docker ps --filter "name=^${CONTAINER_NAME}$" --filter "status=running" \
+         --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+      CONTAINER_RUNNING=true
+    fi
+
+    OLD_WEBHOOK_URL=$(docker inspect "${CONTAINER_NAME}" 2>/dev/null \
+      | grep -oP '(?<="WEBHOOK_URL=)[^"]+' | head -1 || true)
+
+    if $CONTAINER_RUNNING; then
+      info "Container '${CONTAINER_NAME}' EXISTS and is RUNNING."
+    else
+      info "Container '${CONTAINER_NAME}' EXISTS but is STOPPED."
+    fi
+    [[ -n "$OLD_WEBHOOK_URL" ]] && info "Current WEBHOOK_URL: ${OLD_WEBHOOK_URL}"
+  else
+    info "No existing container named '${CONTAINER_NAME}' found."
+  fi
+}
+
+# =============================================================================
+# FUNCTION: update_webhook_url
+# Patches the WEBHOOK_URL in docker-compose.yml with the current URL.
+# =============================================================================
+update_webhook_url() {
+  step "Updating WEBHOOK_URL"
+
+  local compose_file="${N8N_DIR}/docker-compose.yml"
+
+  if [[ ! -f "$compose_file" ]]; then
+    warn "docker-compose.yml not found — regenerating…"
+    create_compose_file
+    return 0
+  fi
+
+  if grep -q "WEBHOOK_URL=" "$compose_file"; then
+    sed -i "s|WEBHOOK_URL=.*|WEBHOOK_URL=${FINAL_URL}|g" "$compose_file"
+    success "WEBHOOK_URL updated → ${FINAL_URL}"
+  else
+    warn "WEBHOOK_URL line not found — regenerating compose file."
+    create_compose_file
+  fi
+
+  # Also remove N8N_SECURE_COOKIE=false if HTTPS is now active
+  if $USE_HTTPS && grep -q "N8N_SECURE_COOKIE=false" "$compose_file"; then
+    sed -i '/N8N_SECURE_COOKIE=false/d' "$compose_file"
+    info "Removed N8N_SECURE_COOKIE=false (HTTPS is active)"
+  fi
+}
+
+# =============================================================================
+# FUNCTION: restart_existing_container
+# =============================================================================
+restart_existing_container() {
+  step "Restarting existing n8n container with updated configuration"
+  cd "${N8N_DIR}"
+
+  info "Stopping container '${CONTAINER_NAME}'…"
+  docker compose down --remove-orphans >> "$LOG_FILE" 2>&1
+  success "Container stopped"
+
+  info "Pulling latest n8nio/n8n image…"
+  docker compose pull >> "$LOG_FILE" 2>&1
+  success "Image check done"
+
+  info "Starting container with new URL: ${FINAL_URL}…"
+  docker compose up -d >> "$LOG_FILE" 2>&1
+  success "Container restarted successfully"
+
+  info "Waiting 5 s for n8n to initialise…"
+  sleep 5
+}
+
+# =============================================================================
 # FUNCTION: create_project_dir
-# Creates the n8n working directory and persistent data folder.
 # =============================================================================
 create_project_dir() {
   step "Creating n8n project directory"
-
   mkdir -p "${N8N_DIR}/n8n_data"
-
-  # Set ownership so the n8n container (uid 1000) can write to the volume
   chown -R 1000:1000 "${N8N_DIR}/n8n_data" 2>/dev/null || true
-
   success "Project directory: ${N8N_DIR}"
   success "Persistent data:   ${N8N_DIR}/n8n_data"
 }
 
 # =============================================================================
 # FUNCTION: create_compose_file
-# Writes the docker-compose.yml into the project directory.
+# Writes docker-compose.yml with all environment variables properly set.
 # =============================================================================
 create_compose_file() {
   step "Generating docker-compose.yml"
 
-  # Determine the host/webhook base URL
-  local host_or_domain
-  if [[ -n "$DOMAIN_NAME" ]]; then
-    host_or_domain="$DOMAIN_NAME"
-    local protocol="https"
-    $USE_HTTPS || protocol="http"
-    WEBHOOK_URL="${protocol}://${host_or_domain}/"
-  else
-    host_or_domain="${PUBLIC_IP}"
-    WEBHOOK_URL="http://${PUBLIC_IP}:${N8N_PORT}/"
-  fi
+  # Determine secure cookie setting
+  local secure_cookie="false"
+  $USE_HTTPS && secure_cookie="true"
+
+  # Determine protocol for N8N_PROTOCOL
+  local n8n_protocol="http"
+  $USE_HTTPS && n8n_protocol="https"
 
   cat > "${N8N_DIR}/docker-compose.yml" <<EOF
 # =============================================================================
-# docker-compose.yml — n8n  (generated by setup-n8n.sh)
+# docker-compose.yml — n8n  (generated by setup-n8n.sh v3.0)
 # Generated : $(date)
+# HTTPS Mode: ${HTTPS_MODE}
 # =============================================================================
 
 version: "3.8"
@@ -530,36 +545,29 @@ services:
     ports:
       - "${N8N_PORT}:5678"
     environment:
-      # Network / host configuration
+      # ── Network ──────────────────────────────────────────
       - N8N_HOST=0.0.0.0
       - N8N_PORT=5678
-      - N8N_PROTOCOL=http
+      - N8N_PROTOCOL=${n8n_protocol}
       - NODE_ENV=production
 
-      # Webhook URL — used by n8n to build callback URLs
-      - WEBHOOK_URL=${WEBHOOK_URL}
+      # ── Webhook URL (auto-detected) ───────────────────────
+      - WEBHOOK_URL=${FINAL_URL}
 
-      # Optional: set a timezone (https://momentjs.com/timezone/)
+      # ── Cookie security (false = allow HTTP/Safari access) ─
+      - N8N_SECURE_COOKIE=${secure_cookie}
+
+      # ── Optional: timezone ────────────────────────────────
       # - GENERIC_TIMEZONE=UTC
 
-      # Optional: basic-auth credentials for the UI (uncomment to enable)
+      # ── Optional: basic auth (uncomment to enable) ────────
       # - N8N_BASIC_AUTH_ACTIVE=true
       # - N8N_BASIC_AUTH_USER=admin
       # - N8N_BASIC_AUTH_PASSWORD=changeme
 
-      # Optional: restrict access to specific origin
-      # - N8N_CORS_ENABLE=true
-
     volumes:
       # Persistent storage — survives container restarts/upgrades
       - ./n8n_data:/home/node/.n8n
-
-    # Limit resource usage (optional — tune to your instance size)
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: '1.0'
-    #       memory: 512M
 EOF
 
   success "docker-compose.yml written to ${N8N_DIR}/docker-compose.yml"
@@ -567,8 +575,7 @@ EOF
 
 # =============================================================================
 # FUNCTION: start_n8n
-# Fresh install path: pulls the latest image and starts the container.
-# Only called when NO existing container was found.
+# Fresh install: pull & start.
 # =============================================================================
 start_n8n() {
   step "Pulling n8n image and starting container (fresh install)"
@@ -582,29 +589,384 @@ start_n8n() {
   docker compose up -d >> "$LOG_FILE" 2>&1
   success "Container started"
 
-  # Give the container a moment to initialise
   info "Waiting 5 s for n8n to initialise…"
   sleep 5
 }
 
 # =============================================================================
+# FUNCTION: install_nginx
+# Installs Nginx if not already present.
+# =============================================================================
+install_nginx() {
+  step "Installing Nginx"
+
+  if command -v nginx &>/dev/null; then
+    info "Nginx already installed: $(nginx -v 2>&1)"
+    success "Skipping Nginx installation"
+    return 0
+  fi
+
+  apt-get install -y nginx >> "$LOG_FILE" 2>&1
+  systemctl enable nginx   >> "$LOG_FILE" 2>&1
+  systemctl start  nginx   >> "$LOG_FILE" 2>&1
+  success "Nginx installed and started"
+}
+
+# =============================================================================
+# FUNCTION: write_nginx_config
+# Writes the Nginx reverse-proxy config for a given domain.
+# =============================================================================
+write_nginx_config() {
+  local domain="$1"
+  step "Writing Nginx config for ${domain}"
+
+  cat > "/etc/nginx/sites-available/n8n" <<NGINXEOF
+# n8n reverse proxy — generated by setup-n8n.sh
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+
+    # Security headers
+    add_header X-Frame-Options    "SAMEORIGIN"  always;
+    add_header X-XSS-Protection   "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # Allow large file uploads for n8n nodes
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass         http://127.0.0.1:${N8N_PORT};
+        proxy_http_version 1.1;
+
+        # WebSocket support — required for n8n real-time UI
+        proxy_set_header   Upgrade           \$http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+
+        # Long timeouts — n8n workflows can run for minutes
+        proxy_read_timeout    3600;
+        proxy_connect_timeout 3600;
+        proxy_send_timeout    3600;
+    }
+}
+NGINXEOF
+
+  # Enable site, disable default
+  ln -sf /etc/nginx/sites-available/n8n /etc/nginx/sites-enabled/n8n
+  rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+
+  nginx -t >> "$LOG_FILE" 2>&1
+  systemctl reload nginx >> "$LOG_FILE" 2>&1
+  success "Nginx config active for ${domain}"
+}
+
+# =============================================================================
+# FUNCTION: install_certbot
+# Installs Certbot and the Nginx plugin.
+# =============================================================================
+install_certbot() {
+  step "Installing Certbot (Let's Encrypt)"
+
+  if command -v certbot &>/dev/null; then
+    info "Certbot already installed: $(certbot --version 2>&1)"
+    success "Skipping Certbot installation"
+    return 0
+  fi
+
+  apt-get install -y certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1
+  success "Certbot installed"
+}
+
+# =============================================================================
+# FUNCTION: obtain_certbot_ssl
+# Runs certbot to get a Let's Encrypt certificate for the domain.
+# =============================================================================
+obtain_certbot_ssl() {
+  local domain="$1"
+  step "Obtaining Let's Encrypt SSL certificate for ${domain}"
+
+  info "Running Certbot (non-interactive)…"
+  if certbot --nginx \
+       --non-interactive \
+       --agree-tos \
+       --register-unsafely-without-email \
+       -d "${domain}" >> "$LOG_FILE" 2>&1; then
+    success "SSL certificate obtained for ${domain}"
+
+    # Set up auto-renewal cron (idempotent)
+    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+      (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
+      success "Auto-renewal cron job added (runs daily at 03:00)"
+    fi
+  else
+    warn "Certbot could not get a certificate automatically."
+    warn "This usually means the domain DNS hasn't propagated yet."
+    warn "Once DNS is ready, run manually:"
+    warn "  sudo certbot --nginx -d ${domain}"
+    warn "Continuing with HTTP for now — n8n is still accessible."
+    USE_HTTPS=false
+    FINAL_URL="http://${PUBLIC_IP}:${N8N_PORT}/"
+  fi
+}
+
+# =============================================================================
+# FUNCTION: setup_duckdns
+# Registers the current IP with DuckDNS and sets up an auto-update cron.
+# =============================================================================
+setup_duckdns() {
+  step "Configuring DuckDNS"
+
+  local subdomain="$DUCKDNS_SUBDOMAIN"
+  local token="$DUCKDNS_TOKEN"
+
+  info "Updating DuckDNS IP for ${subdomain}.duckdns.org → ${PUBLIC_IP}…"
+
+  local response
+  response=$(curl -fsSL \
+    "https://www.duckdns.org/update?domains=${subdomain}&token=${token}&ip=${PUBLIC_IP}" \
+    2>/dev/null || true)
+
+  if [[ "$response" == "OK" ]]; then
+    success "DuckDNS updated: ${subdomain}.duckdns.org → ${PUBLIC_IP}"
+  else
+    warn "DuckDNS update returned: '${response}'"
+    warn "Check your subdomain and token. Continuing anyway…"
+  fi
+
+  # Save DuckDNS updater script for cron
+  mkdir -p /opt/duckdns
+  cat > /opt/duckdns/update.sh <<DUCKEOF
+#!/usr/bin/env bash
+# Auto-update DuckDNS IP — runs every 5 minutes via cron
+SUBDOMAIN="${subdomain}"
+TOKEN="${token}"
+curl -fsSL "https://www.duckdns.org/update?domains=\${SUBDOMAIN}&token=\${TOKEN}&ip=" \
+  -o /tmp/duckdns.log 2>&1
+DUCKEOF
+  chmod +x /opt/duckdns/update.sh
+
+  # Add cron job (idempotent)
+  if ! crontab -l 2>/dev/null | grep -q "duckdns"; then
+    (crontab -l 2>/dev/null; echo "*/5 * * * * /opt/duckdns/update.sh") | crontab -
+    success "DuckDNS auto-update cron added (every 5 min)"
+  fi
+
+  info "Waiting 10 s for DNS to propagate…"
+  sleep 10
+}
+
+# =============================================================================
+# FUNCTION: install_cloudflared
+# Installs the cloudflared binary (Cloudflare Tunnel client).
+# =============================================================================
+install_cloudflared() {
+  step "Installing cloudflared (Cloudflare Tunnel)"
+
+  if command -v cloudflared &>/dev/null; then
+    info "cloudflared already installed: $(cloudflared --version 2>&1 | head -1)"
+    success "Skipping cloudflared installation"
+    return 0
+  fi
+
+  local arch
+  arch=$(uname -m)
+  local deb_url
+
+  case "$arch" in
+    x86_64)  deb_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb" ;;
+    aarch64) deb_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb" ;;
+    *)
+      error "Unsupported architecture: ${arch}"
+      exit 1
+      ;;
+  esac
+
+  info "Downloading cloudflared for ${arch}…"
+  curl -fsSL "$deb_url" -o /tmp/cloudflared.deb >> "$LOG_FILE" 2>&1
+  dpkg -i /tmp/cloudflared.deb                  >> "$LOG_FILE" 2>&1
+  rm -f /tmp/cloudflared.deb
+
+  success "cloudflared installed: $(cloudflared --version 2>&1 | head -1)"
+}
+
+# =============================================================================
+# FUNCTION: start_cloudflare_tunnel
+# Starts a temporary Cloudflare Tunnel and captures the .trycloudflare.com URL.
+# Then installs it as a systemd service for persistence across reboots.
+# =============================================================================
+start_cloudflare_tunnel() {
+  step "Starting Cloudflare Tunnel"
+
+  # Stop any existing tunnel service first
+  systemctl stop cloudflared-n8n 2>/dev/null || true
+
+  info "Starting tunnel to http://localhost:${N8N_PORT}…"
+  info "Waiting for Cloudflare to assign a URL (up to 30 s)…"
+
+  # Run cloudflared in background, capture output
+  cloudflared tunnel --url "http://localhost:${N8N_PORT}" \
+    --no-autoupdate \
+    > /tmp/cloudflared_output.log 2>&1 &
+
+  local cf_pid=$!
+  local tunnel_url=""
+  local waited=0
+
+  # Poll the output file for the tunnel URL
+  while [[ -z "$tunnel_url" && $waited -lt 30 ]]; do
+    sleep 2
+    waited=$(( waited + 2 ))
+    tunnel_url=$(grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' \
+      /tmp/cloudflared_output.log 2>/dev/null | head -1 || true)
+  done
+
+  # Kill the background cloudflared (we'll run it as a service)
+  kill "$cf_pid" 2>/dev/null || true
+  sleep 1
+
+  if [[ -z "$tunnel_url" ]]; then
+    warn "Could not capture Cloudflare Tunnel URL automatically."
+    warn "Starting tunnel as a service — check the URL with:"
+    warn "  journalctl -u cloudflared-n8n -f"
+    tunnel_url="https://<check-journalctl-for-url>.trycloudflare.com"
+  else
+    success "Tunnel URL: ${tunnel_url}"
+  fi
+
+  TUNNEL_URL="$tunnel_url"
+  FINAL_URL="${tunnel_url}/"
+
+  # ── Install as systemd service (survives reboots) ──────────────────────────
+  info "Installing cloudflared as a systemd service…"
+
+  cat > /etc/systemd/system/cloudflared-n8n.service <<SVCEOF
+[Unit]
+Description=Cloudflare Tunnel for n8n
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:${N8N_PORT} --no-autoupdate
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+  # Also try the package install path
+  if [[ -f /usr/bin/cloudflared ]]; then
+    sed -i 's|/usr/local/bin/cloudflared|/usr/bin/cloudflared|g' \
+      /etc/systemd/system/cloudflared-n8n.service
+  fi
+
+  systemctl daemon-reload                    >> "$LOG_FILE" 2>&1
+  systemctl enable cloudflared-n8n           >> "$LOG_FILE" 2>&1
+  systemctl start  cloudflared-n8n           >> "$LOG_FILE" 2>&1
+  success "cloudflared-n8n service enabled and started"
+
+  info "Waiting 10 s for the tunnel to stabilise…"
+  sleep 10
+
+  # Try to grab the live URL from journalctl
+  local live_url
+  live_url=$(journalctl -u cloudflared-n8n --no-pager -n 50 2>/dev/null \
+    | grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' | head -1 || true)
+
+  if [[ -n "$live_url" ]]; then
+    TUNNEL_URL="$live_url"
+    FINAL_URL="${live_url}/"
+    success "Live Tunnel URL confirmed: ${live_url}"
+  fi
+}
+
+# =============================================================================
+# FUNCTION: setup_https
+# Master HTTPS dispatcher — calls the right sub-functions based on HTTPS_MODE.
+# =============================================================================
+setup_https() {
+  case "$HTTPS_MODE" in
+
+    # ── Cloudflare Tunnel ────────────────────────────────────────────────────
+    cloudflare_tunnel)
+      step "Setting up Cloudflare Tunnel (free HTTPS, no domain needed)"
+      install_cloudflared
+      # Set a temporary FINAL_URL before the tunnel starts so compose file is written
+      FINAL_URL="http://${PUBLIC_IP}:${N8N_PORT}/"
+      # Start/restart n8n first so the tunnel has something to proxy
+      if [[ "${CONTAINER_EXISTS:-false}" == "true" ]]; then
+        update_webhook_url
+        restart_existing_container
+      else
+        create_project_dir
+        create_compose_file
+        start_n8n
+      fi
+      # Now start the tunnel — captures the real URL
+      start_cloudflare_tunnel
+      # Update compose file with real tunnel URL
+      update_webhook_url
+      # Restart n8n one more time with the correct WEBHOOK_URL
+      info "Restarting n8n with final Cloudflare Tunnel URL…"
+      cd "${N8N_DIR}"
+      docker compose down >> "$LOG_FILE" 2>&1
+      docker compose up -d >> "$LOG_FILE" 2>&1
+      sleep 5
+      ;;
+
+    # ── DuckDNS + Certbot ────────────────────────────────────────────────────
+    duckdns)
+      step "Setting up DuckDNS + Let's Encrypt SSL"
+      FINAL_URL="https://${DOMAIN_NAME}/"
+      setup_duckdns
+      install_nginx
+      write_nginx_config "${DOMAIN_NAME}"
+      install_certbot
+      obtain_certbot_ssl "${DOMAIN_NAME}"
+      ;;
+
+    # ── Own Domain + Certbot ─────────────────────────────────────────────────
+    own_domain)
+      step "Setting up Nginx + Let's Encrypt SSL for ${DOMAIN_NAME}"
+      FINAL_URL="https://${DOMAIN_NAME}/"
+      install_nginx
+      write_nginx_config "${DOMAIN_NAME}"
+      install_certbot
+      obtain_certbot_ssl "${DOMAIN_NAME}"
+      ;;
+
+    # ── No HTTPS ─────────────────────────────────────────────────────────────
+    none|*)
+      FINAL_URL="http://${PUBLIC_IP}:${N8N_PORT}/"
+      info "HTTPS not configured — using plain HTTP."
+      ;;
+  esac
+}
+
+# =============================================================================
 # FUNCTION: verify_installation
-# Checks the running container and (optionally) the HTTP endpoint.
 # =============================================================================
 verify_installation() {
   step "Verifying installation"
 
-  # Container running?
   if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" \
        --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     success "Container '${CONTAINER_NAME}' is running"
   else
     error "Container '${CONTAINER_NAME}' does NOT appear to be running."
-    error "Check logs with:  docker compose -f ${N8N_DIR}/docker-compose.yml logs"
+    error "Check logs with: docker compose -f ${N8N_DIR}/docker-compose.yml logs"
     exit 1
   fi
 
-  # HTTP health check (best-effort — n8n may still be starting)
+  # Health check against localhost
   local url="http://127.0.0.1:${N8N_PORT}/healthz"
   info "Probing ${url} (3 attempts)…"
   local attempt
@@ -615,29 +977,19 @@ verify_installation() {
     fi
     sleep 5
   done
-  warn "Health check did not respond — n8n may still be starting up."
-  warn "Try  curl -I http://127.0.0.1:${N8N_PORT}/  in a minute."
+  warn "Health check did not respond — n8n may still be starting."
+  warn "Try: curl -I http://127.0.0.1:${N8N_PORT}/"
 }
 
 # =============================================================================
 # FUNCTION: print_summary
-# Prints a friendly end-of-run summary with useful commands.
 # =============================================================================
 print_summary() {
-  local access_url
-  if [[ -n "$DOMAIN_NAME" ]]; then
-    local protocol="http"
-    $USE_HTTPS && protocol="https"
-    access_url="${protocol}://${DOMAIN_NAME}/"
-  else
-    access_url="http://${PUBLIC_IP}:${N8N_PORT}/"
-  fi
-
   echo ""
   echo -e "${GREEN}${BOLD}"
   if [[ "${CONTAINER_EXISTS:-false}" == "true" ]]; then
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║          🔄  n8n Container Restarted with New IP!            ║"
+    echo "║          🔄  n8n Container Restarted with New Config!        ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
   else
     echo "╔══════════════════════════════════════════════════════════════╗"
@@ -646,20 +998,53 @@ print_summary() {
   fi
   echo -e "${RESET}"
 
-  echo -e "${BOLD}  Access n8n at:${RESET}"
-  echo -e "    ${CYAN}${BOLD}${access_url}${RESET}"
-  echo ""
-  echo -e "${BOLD}  Project directory:${RESET}  ${N8N_DIR}"
-  echo -e "${BOLD}  Persistent data:${RESET}    ${N8N_DIR}/n8n_data   ← BACK THIS UP!"
-  echo -e "${BOLD}  Install log:${RESET}        ${LOG_FILE}"
+  # ── Access URL ──────────────────────────────────────────────────────────────
+  echo -e "${BOLD}  🌐 Access n8n at:${RESET}"
+  echo -e "    ${CYAN}${BOLD}${FINAL_URL}${RESET}"
   echo ""
 
-  echo -e "${BOLD}  Container status:${RESET}"
+  # ── HTTPS Mode info ─────────────────────────────────────────────────────────
+  case "$HTTPS_MODE" in
+    cloudflare_tunnel)
+      echo -e "${BOLD}  🔒 HTTPS Mode:${RESET}  Cloudflare Tunnel"
+      echo -e "  ${YELLOW}Note:${RESET} The tunnel URL may change if the service restarts."
+      echo -e "  Check the current live URL with:"
+      echo    "    journalctl -u cloudflared-n8n -n 20 | grep trycloudflare"
+      echo -e "  Tunnel service status:"
+      echo    "    systemctl status cloudflared-n8n"
+      ;;
+    duckdns)
+      echo -e "${BOLD}  🔒 HTTPS Mode:${RESET}  DuckDNS + Let's Encrypt"
+      echo -e "  ${GREEN}SSL auto-renews every 90 days via cron.${RESET}"
+      echo -e "  DuckDNS IP auto-updates every 5 minutes via cron."
+      ;;
+    own_domain)
+      echo -e "${BOLD}  🔒 HTTPS Mode:${RESET}  Own Domain (${DOMAIN_NAME}) + Let's Encrypt"
+      echo -e "  ${GREEN}SSL auto-renews every 90 days via cron.${RESET}"
+      ;;
+    none|*)
+      echo -e "${BOLD}  ⚠️  HTTPS Mode:${RESET}  None (plain HTTP)"
+      echo -e "  ${YELLOW}Tip for Safari:${RESET} If you get a secure cookie error, run:"
+      echo    "    sed -i 's|- NODE_ENV=production|- NODE_ENV=production\\n      - N8N_SECURE_COOKIE=false|' ${N8N_DIR}/docker-compose.yml"
+      echo    "    docker compose -f ${N8N_DIR}/docker-compose.yml up -d"
+      ;;
+  esac
+  echo ""
+
+  # ── Paths ───────────────────────────────────────────────────────────────────
+  echo -e "${BOLD}  📁 Project directory:${RESET}  ${N8N_DIR}"
+  echo -e "${BOLD}  💾 Persistent data:${RESET}    ${N8N_DIR}/n8n_data   ${RED}← BACK THIS UP!${RESET}"
+  echo -e "${BOLD}  📋 Install log:${RESET}        ${LOG_FILE}"
+  echo ""
+
+  # ── Container status ─────────────────────────────────────────────────────────
+  echo -e "${BOLD}  🐳 Container status:${RESET}"
   docker ps --filter "name=${CONTAINER_NAME}" \
     --format "    {{.Names}}\t{{.Status}}\t{{.Ports}}"
   echo ""
 
-  echo -e "${BOLD}  Useful Docker commands:${RESET}"
+  # ── Useful commands ──────────────────────────────────────────────────────────
+  echo -e "${BOLD}  🛠️  Useful Docker commands:${RESET}"
   echo -e "    ${YELLOW}# View live logs${RESET}"
   echo    "    docker compose -f ${N8N_DIR}/docker-compose.yml logs -f"
   echo ""
@@ -669,28 +1054,36 @@ print_summary() {
   echo -e "    ${YELLOW}# Restart n8n${RESET}"
   echo    "    docker compose -f ${N8N_DIR}/docker-compose.yml restart"
   echo ""
-  echo -e "    ${YELLOW}# Update to latest n8n image${RESET}"
+  echo -e "    ${YELLOW}# Update to latest n8n${RESET}"
   echo    "    docker compose -f ${N8N_DIR}/docker-compose.yml pull"
   echo    "    docker compose -f ${N8N_DIR}/docker-compose.yml up -d"
   echo ""
-  echo -e "    ${YELLOW}# Enter the container shell${RESET}"
+  echo -e "    ${YELLOW}# Enter container shell${RESET}"
   echo    "    docker exec -it ${CONTAINER_NAME} sh"
   echo ""
-  echo -e "${BOLD}  Backup command:${RESET}"
+
+  # ── Backup ───────────────────────────────────────────────────────────────────
+  echo -e "${BOLD}  💾 Backup command:${RESET}"
   echo    "    tar czf n8n-backup-\$(date +%Y%m%d).tar.gz ${N8N_DIR}/n8n_data"
   echo ""
 
-  if $USE_HTTPS; then
-    echo -e "${BOLD}${YELLOW}  HTTPS — Next steps (Certbot):${RESET}"
-    echo    "    sudo apt-get install -y certbot python3-certbot-nginx"
-    echo    "    sudo certbot --nginx -d ${DOMAIN_NAME}"
-    echo    "    # Then update WEBHOOK_URL in ${N8N_DIR}/docker-compose.yml"
-    echo    "    # and run: docker compose -f ${N8N_DIR}/docker-compose.yml up -d"
+  # ── Nginx commands (if applicable) ───────────────────────────────────────────
+  if [[ "$HTTPS_MODE" == "duckdns" || "$HTTPS_MODE" == "own_domain" ]]; then
+    echo -e "${BOLD}  🌍 Nginx commands:${RESET}"
+    echo    "    sudo systemctl status nginx"
+    echo    "    sudo nginx -t && sudo systemctl reload nginx"
+    echo    "    sudo certbot renew --dry-run"
     echo ""
   fi
 
-  echo -e "${BOLD}  AWS Security Group reminder:${RESET}"
-  echo -e "    Ensure port ${N8N_PORT} (TCP inbound) is open in your EC2 Security Group."
+  # ── AWS reminder ─────────────────────────────────────────────────────────────
+  echo -e "${BOLD}  ☁️  AWS Security Group reminder:${RESET}"
+  echo -e "    Ensure these ports are open (inbound TCP) in your EC2 Security Group:"
+  echo -e "    Port ${N8N_PORT} (n8n direct access)"
+  if [[ "$HTTPS_MODE" == "duckdns" || "$HTTPS_MODE" == "own_domain" ]]; then
+    echo    "    Port 80  (HTTP / Certbot ACME challenge)"
+    echo    "    Port 443 (HTTPS)"
+  fi
   echo ""
   echo -e "${GREEN}${BOLD}  Happy automating! 🚀${RESET}"
   echo ""
@@ -702,48 +1095,71 @@ print_summary() {
 main() {
   banner
 
-  # Log file header
   {
     echo "=================================================="
-    echo " setup-n8n.sh — started at $(date)"
+    echo " setup-n8n.sh v3.0 — started at $(date)"
     echo "=================================================="
   } > "$LOG_FILE"
 
-  # ── Prerequisites (always run) ─────────────────────────────────────────────
+  # ── Always run ────────────────────────────────────────────────────────────
   check_root
   check_internet
   detect_os
   detect_public_ip
-  optional_prompts
+  optional_prompts       # sets HTTPS_MODE, DOMAIN_NAME, etc.
   system_update
   install_docker
   install_compose
   configure_docker_service
   configure_firewall
 
-  # ── Container existence check ──────────────────────────────────────────────
+  # ── Container check ───────────────────────────────────────────────────────
   check_container_exists
 
-  if [[ "$CONTAINER_EXISTS" == "true" ]]; then
-    # ── PATH A: Container already exists → update IP & restart ──────────────
-    step "Existing container detected — updating IP and restarting"
+  # ── HTTPS setup (Cloudflare Tunnel handles its own n8n lifecycle) ─────────
+  if [[ "$HTTPS_MODE" == "cloudflare_tunnel" ]]; then
+    # cloudflare_tunnel branch manages container start internally
+    setup_https
 
-    # Ensure the project dir / data volume still exist (idempotent)
+  elif [[ "$CONTAINER_EXISTS" == "true" ]]; then
+    # ── PATH A: existing container → update config & restart ─────────────
+    step "Existing container detected — updating configuration and restarting"
+
+    # Set FINAL_URL before updating compose file
+    if $USE_HTTPS && [[ -n "$DOMAIN_NAME" ]]; then
+      FINAL_URL="https://${DOMAIN_NAME}/"
+    else
+      FINAL_URL="http://${PUBLIC_IP}:${N8N_PORT}/"
+    fi
+
     create_project_dir
-
-    # Patch WEBHOOK_URL in docker-compose.yml to current public IP
     update_webhook_url
-
-    # Recreate the container with the new env vars (volume is preserved)
     restart_existing_container
 
+    # Run HTTPS setup after container is up (for duckdns / own_domain)
+    if [[ "$HTTPS_MODE" != "none" ]]; then
+      setup_https
+    fi
+
   else
-    # ── PATH B: No container found → fresh install ───────────────────────────
+    # ── PATH B: fresh install ────────────────────────────────────────────
     step "No existing container — performing fresh installation"
+
+    # Set FINAL_URL before writing compose file
+    if $USE_HTTPS && [[ -n "$DOMAIN_NAME" ]]; then
+      FINAL_URL="https://${DOMAIN_NAME}/"
+    else
+      FINAL_URL="http://${PUBLIC_IP}:${N8N_PORT}/"
+    fi
 
     create_project_dir
     create_compose_file
     start_n8n
+
+    # Run HTTPS setup after container is up (for duckdns / own_domain)
+    if [[ "$HTTPS_MODE" != "none" ]]; then
+      setup_https
+    fi
   fi
 
   # ── Always verify & summarise ─────────────────────────────────────────────
